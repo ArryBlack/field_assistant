@@ -249,7 +249,13 @@ async def generate_description(
         }
         
         # 4. Send to Gemini
-        prompt_text = request.prompt or "Describe this image. Be concise and objective."
+        prompt = f"""
+            Describe this image, be concise and objective.
+            Below is the context for the image. It might or might not be relevant, but it could help you understand the image better: {request.prompt}
+            If a location is mentioned, it will always be relevant. 
+
+            """
+        prompt_text = prompt.strip()
         # Pass the prompt and the image part (raw bytes)
         response = await vision_model.generate_content_async([prompt_text, image_part])
         
