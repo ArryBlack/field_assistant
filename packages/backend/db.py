@@ -34,8 +34,21 @@ CREATE TABLE IF NOT EXISTS messages (
   user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
   chat_id BIGINT,
   text TEXT,
+  survey_question TEXT,
   timestamp TIMESTAMP WITH TIME ZONE,
   raw_json JSONB
+);
+
+-- trips
+CREATE TABLE IF NOT EXISTS trips (
+  trip_id SERIAL PRIMARY KEY,
+  telegram_user_id BIGINT REFERENCES users(telegram_user_id) ON DELETE CASCADE,
+  start_date TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  destination TEXT,
+  target_species TEXT,
+  guide TEXT,
+  context TEXT,
+  end_date TIMESTAMP WITH TIME ZONE
 );
 
 -- media

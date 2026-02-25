@@ -1,5 +1,5 @@
 import uvicorn
-from fastapi import FastAPI, Depends, HTTPException, Query, Body
+from fastapi import FastAPI, Depends, HTTPException, Query, Body, logger
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Optional
 from datetime import date, datetime
@@ -12,7 +12,8 @@ import mimetypes
 import math
 import io
 import google.generativeai as genai
-
+import logging, time
+from fastapi import Request
 
 # Import shared database and models
 import db
@@ -23,6 +24,33 @@ from models import (
 )
 # --- Pydantic models for API request bodies ---
 from pydantic import BaseModel
+
+# --- Logging Configuration ---
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(name)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
+
+# --- Custom Database Cursor ---
+class LoggingDictCursor(psycopg2.extras.RealDictCursor):
+    """A custom cursor that automatically logs every SQL query and its execution time."""
+    def execute(self, query, vars=None):
+        start_time = time.time()
+        # Clean up the query string for the logs (removes extra newlines/spaces)
+        clean_query = " ".join(query.split())
+        logger.info(f"DB Query: {clean_query} | Params: {vars}")
+        
+        try:
+            result = super().execute(query, vars)
+            exec_time = time.time() - start_time
+            logger.info(f"DB Query Success | Time: {exec_time:.4f}s")
+            return result
+        except Exception as e:
+            exec_time = time.time() - start_time
+            logger.error(f"DB Query Failed | Time: {exec_time:.4f}s | Error: {e}")
+            raise
 
 class GenerateRequest(BaseModel):
     prompt: Optional[str] = None
@@ -71,6 +99,22 @@ app.add_middleware(
     allow_methods=["*", "GET", "POST", "PUT", "OPTIONS"],
     allow_headers=["*", "Content-Type", "Authorization"],
 )
+# --- API Logging Middleware ---
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    """Intercepts all API requests, logs them, and times the response."""
+    start_time = time.time()
+    logger.info(f"API Request: {request.method} {request.url}")
+    
+    try:
+        response = await call_next(request)
+        process_time = time.time() - start_time
+        logger.info(f"API Response: {response.status_code} | Time: {process_time:.4f}s")
+        return response
+    except Exception as e:
+        process_time = time.time() - start_time
+        logger.error(f"API Error: {request.method} {request.url} | Time: {process_time:.4f}s | Exception: {e}")
+        raise
 
 # --- Database Dependency ---
 def get_db_connection():
@@ -82,7 +126,7 @@ def get_db_connection():
 
 # --- Helper function to get a single media item ---
 def get_media_item(media_id: int, conn):
-    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+    with conn.cursor(cursor_factory=LoggingDictCursor) as cur:
         cur.execute("SELECT * FROM media WHERE id = %s", (media_id,))
         media = cur.fetchone()
         if not media:
@@ -112,7 +156,7 @@ def get_media_url(key: str = Query(..., min_length=1)):
 
 @app.get("/users", response_model=List[User])
 def get_all_users(conn: psycopg2.extensions.connection = Depends(get_db_connection)):
-    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+    with conn.cursor(cursor_factory=LoggingDictCursor) as cur:
         cur.execute("SELECT * FROM users ORDER BY first_name;")
         return cur.fetchall()
 
@@ -125,7 +169,7 @@ def get_all_messages(
     page: int = Query(1, ge=1),
     limit: int = Query(25, ge=1, le=100)
 ):
-    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+    with conn.cursor(cursor_factory=LoggingDictCursor) as cur:
         where_clauses = []
         filter_params = []
         join_clause = "LEFT JOIN users u ON m.user_id = u.id" 
@@ -188,7 +232,7 @@ async def update_description(
     conn: psycopg2.extensions.connection = Depends(get_db_connection)
 ):
     description = payload.description
-    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+    with conn.cursor(cursor_factory=LoggingDictCursor) as cur:
         cur.execute(
             "UPDATE media SET description = %s WHERE id = %s RETURNING *", 
             (description, media_id)
@@ -206,7 +250,7 @@ async def update_transcription(
     conn: psycopg2.extensions.connection = Depends(get_db_connection)
 ):
     transcription = payload.transcription
-    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+    with conn.cursor(cursor_factory=LoggingDictCursor) as cur:
         cur.execute(
             "UPDATE media SET transcription = %s WHERE id = %s RETURNING *", 
             (transcription, media_id)
@@ -223,7 +267,7 @@ async def generate_description(
     request: GenerateRequest,
     conn: psycopg2.extensions.connection = Depends(get_db_connection)
 ):
-    """Generates a description for an image using Gemini."""
+    """Generates a description for an image using Gemini, including trip and caption context."""
     if not GOOGLE_API_KEY:
         raise HTTPException(status_code=501, detail="Gemini API key not configured")
 
@@ -233,15 +277,34 @@ async def generate_description(
 
     try:
         caption_context = ""
-        if media.get("message_id"):
-            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                cur.execute("SELECT text FROM messages WHERE id = %s", (media["message_id"],))
-                msg_row = cur.fetchone()
-                if msg_row and msg_row["text"]:
-                    caption_context = msg_row["text"]
-        # --- THIS IS THE FIX ---
+        trip_context_str = ""
         
-        # 1. Download image bytes from S3 (e.g., 5MB)
+        # --- NEW LOGIC: Fetch caption AND trip context in one query ---
+        if media.get("message_id"):
+            with conn.cursor(cursor_factory=LoggingDictCursor) as cur:
+                query = """
+                    SELECT 
+                        m.text AS caption, 
+                        t.context AS trip_context
+                    FROM messages m
+                    JOIN users u ON m.user_id = u.id
+                    LEFT JOIN trips t ON u.telegram_user_id = t.telegram_user_id
+                        AND m.timestamp >= t.start_date 
+                        AND (t.end_date IS NULL OR m.timestamp <= t.end_date)
+                    WHERE m.id = %s
+                    ORDER BY t.start_date DESC 
+                    LIMIT 1;
+                """
+                cur.execute(query, (media["message_id"],))
+                row = cur.fetchone()
+                
+                if row:
+                    if row["caption"]:
+                        caption_context = row["caption"]
+                    if row["trip_context"]:
+                        trip_context_str = f"Trip Context (Destination, Guide, Target): {row['trip_context']}\n"
+        
+        # 1. Download image bytes from S3
         obj = s3_client.get_object(Bucket=S3_BUCKET_NAME, Key=media["file_path"])
         image_bytes = obj['Body'].read()
         
@@ -249,28 +312,31 @@ async def generate_description(
         mime_type = media["mime_type"] or mimetypes.guess_type(media["file_name"])[0]
         
         # 3. Create a 'Part' object for Gemini using the raw bytes
-        # We are SKIPPING the memory-intensive Pillow (Image.open) step
         image_part = {
             "mime_type": mime_type,
             "data": image_bytes
         }
         
-        # 4. Send to Gemini
+        # 4. Construct the dynamically injected prompt
+        user_prompt = request.prompt or ""
         prompt = f"""
-            Describe this image, be concise, objective and relevant to the caption.
-            Below is the context for the image. It might or might not be relevant, but it could help you understand the image better: 
-            {request.prompt}
-            If a location is mentioned, it will always be relevant. 
-            Original caption or message text (if any): {caption_context}
-            """
+        Describe this image, be concise, objective and relevant to the caption.
+        Below is the context for the image. It might or might not be relevant, but it could help you understand the image better: 
+        {user_prompt}
+        If a location is mentioned, it will always be relevant. 
+        {trip_context_str}
+        Original caption or message text (if any): {caption_context}
+        """
         prompt_text = prompt.strip()
-        # Pass the prompt and the image part (raw bytes)
+        
+        # 5. Send to Gemini
+        logger.info(f"Sending image description request to Gemini for media_id {media_id}")
+        logger.info(f"--- GEMINI PROMPT START ---\n{prompt_text}\n--- GEMINI PROMPT END ---")
         response = await vision_model.generate_content_async([prompt_text, image_part])
-        
         description = response.text
-        
-        # 5. Save to database
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        logger.info(f"--- GEMINI RESPONSE START ---\n{description}\n--- GEMINI RESPONSE END ---")
+        # 6. Save to database
+        with conn.cursor(cursor_factory=LoggingDictCursor) as cur:
             cur.execute(
                 "UPDATE media SET description = %s WHERE id = %s RETURNING *",
                 (description, media_id)
@@ -311,7 +377,7 @@ async def generate_transcription(
         response = await vision_model.generate_content_async([prompt_text, audio_file])
         transcription = response.text
         
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        with conn.cursor(cursor_factory=LoggingDictCursor) as cur:
             cur.execute(
                 "UPDATE media SET transcription = %s WHERE id = %s RETURNING *",
                 (transcription, media_id)
@@ -346,7 +412,7 @@ def get_all_messages_for_export(
     and formats them into a structured JSON list for summarization.
     Saves a local copy for testing.
     """
-    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+    with conn.cursor(cursor_factory=LoggingDictCursor) as cur:
         
         # 1. Build the dynamic query (same as /messages)
         query = """
