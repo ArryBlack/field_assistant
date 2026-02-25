@@ -232,6 +232,13 @@ async def generate_description(
         raise HTTPException(status_code=400, detail="Media has no file path")
 
     try:
+        caption_context = ""
+        if media.get("message_id"):
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute("SELECT text FROM messages WHERE id = %s", (media["message_id"],))
+                msg_row = cur.fetchone()
+                if msg_row and msg_row["text"]:
+                    caption_context = msg_row["text"]
         # --- THIS IS THE FIX ---
         
         # 1. Download image bytes from S3 (e.g., 5MB)
@@ -253,7 +260,7 @@ async def generate_description(
             Describe this image, be concise and objective.
             Below is the context for the image. It might or might not be relevant, but it could help you understand the image better: {request.prompt}
             If a location is mentioned, it will always be relevant. 
-
+            Original caption or message text (if any): {caption_context}
             """
         prompt_text = prompt.strip()
         # Pass the prompt and the image part (raw bytes)
