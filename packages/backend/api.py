@@ -257,8 +257,9 @@ async def generate_description(
         
         # 4. Send to Gemini
         prompt = f"""
-            Describe this image, be concise and objective.
-            Below is the context for the image. It might or might not be relevant, but it could help you understand the image better: {request.prompt}
+            Describe this image, be concise, objective and relevant to the caption.
+            Below is the context for the image. It might or might not be relevant, but it could help you understand the image better: 
+            {request.prompt}
             If a location is mentioned, it will always be relevant. 
             Original caption or message text (if any): {caption_context}
             """
