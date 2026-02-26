@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
 import os
+import time
+
 import asyncio
 import json
 import logging
@@ -25,7 +27,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-import time
 
 # --- Custom Database Cursors for Logging ---
 class LoggingCursor(psycopg2.extensions.cursor):
@@ -343,6 +344,26 @@ async def process_update(conn, update_obj, bot: Bot):
             conn.commit()
             
         await bot.send_message(chat_id=msg.chat.id, text=f"Question 1: {QUESTION_BANK[0]}")
+        insert_message(conn, update_id, msg, user_id_db, survey_question=None)
+        return
+
+    if text.strip() == "/end_trip":
+        logger.info(f"User {from_user.id} initiated /end_trip")
+        updated = end_active_trip(conn, from_user.id)
+        
+        # Force-clear all FSM states so the bot doesn't get stuck!
+        with conn.cursor(cursor_factory=LoggingCursor) as cur:
+            cur.execute("UPDATE user_states SET current_state = NULL, current_step = 0 WHERE user_id = %s", (user_id_db,))
+            conn.commit()
+            
+        if user_id_db in active_conversations:
+            del active_conversations[user_id_db]
+            
+        if updated > 0:
+            await bot.send_message(chat_id=msg.chat.id, text="Trip ended successfully. Safe travels!")
+        else:
+            await bot.send_message(chat_id=msg.chat.id, text="You don't currently have an active trip to end.")
+            
         insert_message(conn, update_id, msg, user_id_db, survey_question=None)
         return
 
