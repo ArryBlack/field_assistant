@@ -25,7 +25,9 @@ COPY . /app
 
 # Copy start script from package folder
 COPY packages/backend/start.sh /usr/local/bin/start.sh
-RUN chmod +x /usr/local/bin/start.sh
+# Ensure LF line endings (avoid CRLF issues from Windows hosts)
+RUN sed -i 's/\r$//' /usr/local/bin/start.sh \
+    && chmod +x /usr/local/bin/start.sh
 
 # Create non-root user
 RUN useradd --create-home appuser || true
