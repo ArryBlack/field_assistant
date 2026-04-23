@@ -89,9 +89,9 @@ app = FastAPI(
     description="API for the Telegram bot archiver",
     version="1.0.0"
 )
-
+FRONTEND_ORIGIN = os.environ.get('VITE_UI_URL')
 # --- CORS Configuration ---
-origins = ["*", "http://localhost:9000", "https://localhost:9000"] # Allow all origins for simplicity
+origins = [FRONTEND_ORIGIN] if FRONTEND_ORIGIN else ["localhost:8000"]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
