@@ -1,0 +1,33 @@
+version: '3.8'
+
+services:
+  backend-api:
+    build:
+      context: .
+      dockerfile: packages/backend/Dockerfile
+    env_file: .env
+    environment:
+      - PYTHONUNBUFFERED=1
+    ports:
+      - "5002:8000"
+    restart: unless-stopped
+
+  fetcher:
+    build:
+      context: .
+      dockerfile: packages/backend/Dockerfile
+    env_file: .env
+    command: ["/usr/local/bin/start.sh", "fetcher"]
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: packages/frontend/Dockerfile
+      args:
+        VITE_API_URL: ${VITE_API_URL:-http://backend-api:5002}
+    ports:
+      - "5003:80"
+    restart: unless-stopped
+    depends_on:
+      - backend-api
