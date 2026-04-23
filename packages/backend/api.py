@@ -91,7 +91,7 @@ app = FastAPI(
 )
 FRONTEND_ORIGIN = os.environ.get('VITE_UI_URL')
 # --- CORS Configuration ---
-origins = [FRONTEND_ORIGIN] if FRONTEND_ORIGIN else ["localhost:8000"]
+origins = [FRONTEND_ORIGIN, 'http://localhost:5003'] if FRONTEND_ORIGIN else ["localhost:8000"]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
