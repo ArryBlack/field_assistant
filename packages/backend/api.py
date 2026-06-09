@@ -1,523 +1,199 @@
-import uvicorn
-from fastapi import FastAPI, Depends, HTTPException, Query, Body, logger
-from fastapi.middleware.cors import CORSMiddleware
-from typing import List, Optional
-from datetime import date, datetime
-import json
-import psycopg2
-import psycopg2.extras
 import os
-import boto3
-import mimetypes 
+import time
 import math
-import io
-import google.generativeai as genai
-import logging, time
-from fastapi import Request
+import mimetypes
+from datetime import datetime
+from typing import Optional
 
-# Import shared database and models
-import db
-from models import (
-    MessageWithRelations, User, Media, PaginatedMessages,
-    GenerateRequest, UpdateDescriptionRequest, UpdateTranscriptionRequest,
-    SummarizeRequest, ExportMessage  
-)
-# --- Pydantic models for API request bodies ---
-from pydantic import BaseModel
+import aiofiles
+from fastapi import FastAPI, Request, Query, HTTPException, Body
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
-# --- Logging Configuration ---
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(name)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
-logger = logging.getLogger(__name__)
+# Import our modular services
+from packages.backend.services.database import DatabaseClient
+from packages.backend.services.llm import GeminiAssistant
 
-# --- Custom Database Cursor ---
-class LoggingDictCursor(psycopg2.extras.RealDictCursor):
-    """A custom cursor that automatically logs every SQL query and its execution time."""
-    def execute(self, query, vars=None):
-        start_time = time.time()
-        # Clean up the query string for the logs (removes extra newlines/spaces)
-        clean_query = " ".join(query.split())
-        logger.info(f"DB Query: {clean_query} | Params: {vars}")
+# --- FORCE MIME TYPES FOR BROWSERS ---
+mimetypes.add_type('audio/ogg', '.oga')
+mimetypes.add_type('audio/ogg', '.ogg')
+mimetypes.add_type('audio/mpeg', '.mp3')
+mimetypes.add_type('video/mp4', '.mp4')
+
+
+class FieldNotesAPI:
+    def __init__(self):
+        """Initializes the FastAPI application, services, and route bindings."""
+        self.app = FastAPI(title="FieldNotes API", description="Backend API for documentary field notes.")
         
-        try:
-            result = super().execute(query, vars)
-            exec_time = time.time() - start_time
-            logger.info(f"DB Query Success | Time: {exec_time:.4f}s")
-            return result
-        except Exception as e:
-            exec_time = time.time() - start_time
-            logger.error(f"DB Query Failed | Time: {exec_time:.4f}s | Error: {e}")
-            raise
+        # Initialize Core Services
+        self.db = DatabaseClient(uri=os.environ.get("MONGO_URI", "mongodb://mongodb:27017"))
+        self.ai = GeminiAssistant(api_key=os.environ.get("GOOGLE_API_KEY"))
+        
+        # Setup Storage
+        self.local_media_path = os.environ.get("LOCAL_MEDIA_PATH", "/app/media")
+        os.makedirs(self.local_media_path, exist_ok=True)
+        
+        # Wire up the application
+        self._setup_middleware()
+        self._setup_routes()
 
-class GenerateRequest(BaseModel):
-    prompt: Optional[str] = None
-
-class UpdateDescriptionRequest(BaseModel):
-    description: str = ""
-
-class UpdateTranscriptionRequest(BaseModel):
-    transcription: str = ""
-
-# --- S3 Configuration ---
-S3_BUCKET_NAME = os.environ.get('S3_BUCKET_NAME')
-S3_ENDPOINT_URL = os.environ.get('S3_ENDPOINT_URL')
-S3_ACCESS_KEY_ID = os.environ.get('S3_ACCESS_KEY_ID')
-S3_SECRET_ACCESS_KEY = os.environ.get('S3_SECRET_ACCESS_KEY')
-
-s3_client = boto3.client(
-    's3',
-    endpoint_url=S3_ENDPOINT_URL,
-    aws_access_key_id=S3_ACCESS_KEY_ID,
-    aws_secret_access_key=S3_SECRET_ACCESS_KEY
-)
-
-# --- Gemini Configuration ---
-GOOGLE_API_KEY = os.environ.get('GOOGLE_API_KEY')
-if GOOGLE_API_KEY:
-    genai.configure(api_key=GOOGLE_API_KEY)
-else:
-    print("Warning: GOOGLE_API_KEY not set. AI features will be disabled.")
-
-vision_model = genai.GenerativeModel("gemini-2.5-flash")
-
-# --- App Initialization ---
-app = FastAPI(
-    title="Field Assistant API",
-    description="API for the Telegram bot archiver",
-    version="1.0.0"
-)
-FRONTEND_ORIGIN = os.environ.get('VITE_UI_URL')
-# --- CORS Configuration ---
-origins = [FRONTEND_ORIGIN, 'http://localhost:5003'] if FRONTEND_ORIGIN else ["localhost:8000"]
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
-    allow_methods=["*", "GET", "POST", "PUT", "OPTIONS"],
-    allow_headers=["*", "Content-Type", "Authorization"],
-)
-# --- API Logging Middleware ---
-@app.middleware("http")
-async def log_requests(request: Request, call_next):
-    """Intercepts all API requests, logs them, and times the response."""
-    start_time = time.time()
-    logger.info(f"API Request: {request.method} {request.url}")
-    
-    try:
-        response = await call_next(request)
-        process_time = time.time() - start_time
-        logger.info(f"API Response: {response.status_code} | Time: {process_time:.4f}s")
-        return response
-    except Exception as e:
-        process_time = time.time() - start_time
-        logger.error(f"API Error: {request.method} {request.url} | Time: {process_time:.4f}s | Exception: {e}")
-        raise
-
-# --- Database Dependency ---
-def get_db_connection():
-    conn = db.get_conn()
-    try:
-        yield conn
-    finally:
-        conn.close()
-
-# --- Helper function to get a single media item ---
-def get_media_item(media_id: int, conn):
-    with conn.cursor(cursor_factory=LoggingDictCursor) as cur:
-        cur.execute("SELECT * FROM media WHERE id = %s", (media_id,))
-        media = cur.fetchone()
-        if not media:
-            raise HTTPException(status_code=404, detail="Media not found")
-        return media
-
-# --- API Endpoints ---
-
-@app.get("/")
-def read_root():
-    return {"message": "Welcome to the Field Assistant API!"}
-
-@app.get("/media-url")
-def get_media_url(key: str = Query(..., min_length=1)):
-    if not S3_BUCKET_NAME:
-        raise HTTPException(status_code=500, detail="S3 bucket not configured")
-    try:
-        url = s3_client.generate_presigned_url(
-            'get_object',
-            Params={'Bucket': S3_BUCKET_NAME, 'Key': key},
-            ExpiresIn=3600
+    def _setup_middleware(self):
+        """Configures CORS and request logging middleware."""
+        origins = [os.environ.get("VITE_UI_URL", "http://localhost:5003")]
+        self.app.add_middleware(
+            CORSMiddleware, 
+            allow_origins=["*"] if "*" in origins else origins, 
+            allow_methods=["*"], 
+            allow_headers=["*"]
         )
-        return {"url": url}
-    except Exception as e:
-        print(f"Error generating presigned URL: {e}")
-        raise HTTPException(status_code=500, detail="Could not generate media URL")
 
-@app.get("/users", response_model=List[User])
-def get_all_users(conn: psycopg2.extensions.connection = Depends(get_db_connection)):
-    with conn.cursor(cursor_factory=LoggingDictCursor) as cur:
-        cur.execute("SELECT * FROM users ORDER BY first_name;")
-        return cur.fetchall()
-
-@app.get("/messages", response_model=PaginatedMessages)
-def get_all_messages(
-    conn: psycopg2.extensions.connection = Depends(get_db_connection),
-    telegram_user_id: Optional[int] = Query(None),
-    start_date: Optional[datetime] = Query(None),
-    end_date: Optional[datetime] = Query(None),
-    page: int = Query(1, ge=1),
-    limit: int = Query(25, ge=1, le=100)
-):
-    with conn.cursor(cursor_factory=LoggingDictCursor) as cur:
-        where_clauses = []
-        filter_params = []
-        join_clause = "LEFT JOIN users u ON m.user_id = u.id" 
-        
-        if telegram_user_id:
-            where_clauses.append("u.telegram_user_id = %s")
-            filter_params.append(telegram_user_id)
-        if start_date:
-            where_clauses.append("m.timestamp >= %s")
-            filter_params.append(start_date)
-        if end_date:
-            where_clauses.append("m.timestamp <= %s")
-            filter_params.append(end_date)
-        
-        where_sql = ""
-        if where_clauses:
-            where_sql = " WHERE " + " AND ".join(where_clauses)
-            
-        count_query = f"SELECT COUNT(m.id) FROM messages m {join_clause} {where_sql};"
-        cur.execute(count_query, tuple(filter_params))
-        total_count = cur.fetchone()['count']
-        
-        if total_count == 0:
-            return {"messages": [], "total_count": 0, "total_pages": 0, "current_page": 1}
-
-        total_pages = math.ceil(total_count / limit)
-        offset = (page - 1) * limit
-        
-        main_query = f"""
-            SELECT 
-                m.id, m.telegram_message_id, m.update_id, m.user_id, 
-                m.chat_id, m.text, m.survey_question, m.timestamp, m.raw_json,
-                to_jsonb(u) as user,
-                COALESCE(
-                    (SELECT jsonb_agg(med.* ORDER BY med.id) FROM media med WHERE med.message_id = m.id), 
-                    '[]'::jsonb
-                ) as media
-            FROM messages m
-            {join_clause}
-            {where_sql}
-            ORDER BY m.timestamp DESC
-            LIMIT %s OFFSET %s;
-        """
-        
-        final_params = tuple(filter_params) + (limit, offset)
-        cur.execute(main_query, final_params)
-        messages = cur.fetchall()
-        
-        return {
-            "messages": messages,
-            "total_count": total_count,
-            "total_pages": total_pages,
-            "current_page": page
-        }
-
-@app.put("/media/{media_id}/description", response_model=Media)
-async def update_description(
-    media_id: int, 
-    payload: UpdateDescriptionRequest,
-    conn: psycopg2.extensions.connection = Depends(get_db_connection)
-):
-    description = payload.description
-    with conn.cursor(cursor_factory=LoggingDictCursor) as cur:
-        cur.execute(
-            "UPDATE media SET description = %s WHERE id = %s RETURNING *", 
-            (description, media_id)
-        )
-        updated_media = cur.fetchone()
-        conn.commit()
-        if not updated_media:
-            raise HTTPException(status_code=404, detail="Media not found")
-        return updated_media
-
-@app.put("/media/{media_id}/transcription", response_model=Media)
-async def update_transcription(
-    media_id: int, 
-    payload: UpdateTranscriptionRequest,
-    conn: psycopg2.extensions.connection = Depends(get_db_connection)
-):
-    transcription = payload.transcription
-    with conn.cursor(cursor_factory=LoggingDictCursor) as cur:
-        cur.execute(
-            "UPDATE media SET transcription = %s WHERE id = %s RETURNING *", 
-            (transcription, media_id)
-        )
-        updated_media = cur.fetchone()
-        conn.commit()
-        if not updated_media:
-            raise HTTPException(status_code=404, detail="Media not found")
-        return updated_media
-
-@app.post("/media/{media_id}/generate-description", response_model=Media)
-async def generate_description(
-    media_id: int,
-    request: GenerateRequest,
-    conn: psycopg2.extensions.connection = Depends(get_db_connection)
-):
-    """Generates a description for an image using Gemini, including trip and caption context."""
-    if not GOOGLE_API_KEY:
-        raise HTTPException(status_code=501, detail="Gemini API key not configured")
-
-    media = get_media_item(media_id, conn)
-    if not media["file_path"]:
-        raise HTTPException(status_code=400, detail="Media has no file path")
-
-    try:
-        caption_context = ""
-        trip_context_str = ""
-        
-        # --- NEW LOGIC: Fetch caption AND trip context in one query ---
-        if media.get("message_id"):
-            with conn.cursor(cursor_factory=LoggingDictCursor) as cur:
-                query = """
-                    SELECT 
-                        m.text AS caption, 
-                        t.context AS trip_context
-                    FROM messages m
-                    JOIN users u ON m.user_id = u.id
-                    LEFT JOIN trips t ON u.telegram_user_id = t.telegram_user_id
-                        AND m.timestamp >= t.start_date 
-                        AND (t.end_date IS NULL OR m.timestamp <= t.end_date)
-                    WHERE m.id = %s
-                    ORDER BY t.start_date DESC 
-                    LIMIT 1;
-                """
-                cur.execute(query, (media["message_id"],))
-                row = cur.fetchone()
-                
-                if row:
-                    if row["caption"]:
-                        caption_context = row["caption"]
-                    if row["trip_context"]:
-                        trip_context_str = f"Trip Context (Destination, Guide, Target): {row['trip_context']}\n"
-        
-        # 1. Download image bytes from S3
-        obj = s3_client.get_object(Bucket=S3_BUCKET_NAME, Key=media["file_path"])
-        image_bytes = obj['Body'].read()
-        
-        # 2. Get the mime type (e.g., 'image/jpeg')
-        mime_type = media["mime_type"] or mimetypes.guess_type(media["file_name"])[0]
-        
-        # 3. Create a 'Part' object for Gemini using the raw bytes
-        image_part = {
-            "mime_type": mime_type,
-            "data": image_bytes
-        }
-        
-        # 4. Construct the dynamically injected prompt
-        user_prompt = request.prompt or ""
-        prompt = f"""
-        Describe this image, be concise, objective and relevant to the caption.
-        Below is the context for the image. It might or might not be relevant, but it could help you understand the image better: 
-        {user_prompt}
-        If a location is mentioned, it will always be relevant. 
-        {trip_context_str}
-        Original caption or message text (if any): {caption_context}
-        """
-        prompt_text = prompt.strip()
-        
-        # 5. Send to Gemini
-        logger.info(f"Sending image description request to Gemini for media_id {media_id}")
-        logger.info(f"--- GEMINI PROMPT START ---\n{prompt_text}\n--- GEMINI PROMPT END ---")
-        response = await vision_model.generate_content_async([prompt_text, image_part])
-        description = response.text
-        logger.info(f"--- GEMINI RESPONSE START ---\n{description}\n--- GEMINI RESPONSE END ---")
-        # 6. Save to database
-        with conn.cursor(cursor_factory=LoggingDictCursor) as cur:
-            cur.execute(
-                "UPDATE media SET description = %s WHERE id = %s RETURNING *",
-                (description, media_id)
-            )
-            updated_media = cur.fetchone()
-            conn.commit()
-            return updated_media
-            
-    except Exception as e:
-        print(f"Error generating description: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/media/{media_id}/generate-transcription", response_model=Media)
-async def generate_transcription(
-    media_id: int, 
-    request: GenerateRequest,
-    conn: psycopg2.extensions.connection = Depends(get_db_connection)
-):
-    if not GOOGLE_API_KEY:
-        raise HTTPException(status_code=501, detail="Gemini API key not configured")
-    media = get_media_item(media_id, conn)
-    if not media["file_path"]:
-        raise HTTPException(status_code=400, detail="Media has no file path")
-    
-    audio_file = None
-    try:
-        obj = s3_client.get_object(Bucket=S3_BUCKET_NAME, Key=media["file_path"])
-        audio_bytes = obj['Body'].read()
-        mime_type = media["mime_type"] or mimetypes.guess_type(media["file_name"])[0]
-        
-        audio_file = genai.upload_file(
-            path=io.BytesIO(audio_bytes),
-            display_name=media["file_name"],
-            mime_type=mime_type
-        )
-        
-        prompt_text = request.prompt or "Transcribe this audio. Only return the transcribed text."
-        response = await vision_model.generate_content_async([prompt_text, audio_file])
-        transcription = response.text
-        
-        with conn.cursor(cursor_factory=LoggingDictCursor) as cur:
-            cur.execute(
-                "UPDATE media SET transcription = %s WHERE id = %s RETURNING *",
-                (transcription, media_id)
-            )
-            updated_media = cur.fetchone()
-            conn.commit()
-            return updated_media
-            
-    except Exception as e:
-        print(f"Error generating transcription: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        if audio_file:
+        @self.app.middleware("http")
+        async def log_requests(request: Request, call_next):
+            start_time = time.time()
             try:
-                genai.files.delete_file(audio_file.name)
-                print(f"Cleaned up Gemini file: {audio_file.name}")
+                response = await call_next(request)
+                process_time = time.time() - start_time
+                print(f"API Request: {request.method} {request.url} | Time: {process_time:.4f}s | Status: {response.status_code}")
+                return response
             except Exception as e:
-                print(f"Warning: Failed to delete Gemini file {audio_file.name}: {e}")
+                process_time = time.time() - start_time
+                print(f"API Error: {request.method} {request.url} | Time: {process_time:.4f}s | Exception: {str(e)}")
+                raise
 
+    def _setup_routes(self):
+        """Mounts static files and binds class methods explicitly to API endpoints."""
+        self.app.mount("/static-media", StaticFiles(directory=self.local_media_path, html=True), name="static_media")
+        
+        # Data Read Endpoints
+        self.app.add_api_route("/users", self.get_all_users, methods=["GET"])
+        self.app.add_api_route("/trips", self.get_trips, methods=["GET"])
+        self.app.add_api_route("/messages", self.get_messages, methods=["GET"])
+        self.app.add_api_route("/messages/export", self.export_messages, methods=["GET"])
+        
+        # Media & AI Endpoints
+        self.app.add_api_route("/media-url", self.get_media_url, methods=["GET"])
+        self.app.add_api_route("/media/{media_id}/{field_name}", self.update_media_field, methods=["PUT"])
+        self.app.add_api_route("/media/{media_id}/generate-description", self.generate_media_description, methods=["POST"])
+        self.app.add_api_route("/media/{media_id}/generate-transcription", self.generate_media_transcription, methods=["POST"])
 
-# ---  ENDPOINT FOR SUMMARIZATION (EXPORT) ---
-@app.get("/messages/export", response_model=List[ExportMessage]) 
-def get_all_messages_for_export(
-    conn: psycopg2.extensions.connection = Depends(get_db_connection),
-    # It accepts the exact same filters as /messages
-    telegram_user_id: Optional[int] = Query(None),
-    start_date: Optional[datetime] = Query(None),
-    end_date: Optional[datetime] = Query(None)
-):
-    """
-    Fetches ALL messages matching a filter, without pagination,
-    and formats them into a structured JSON list for summarization.
-    Saves a local copy for testing.
-    """
-    with conn.cursor(cursor_factory=LoggingDictCursor) as cur:
-        
-        # 1. Build the dynamic query (same as /messages)
-        query = """
-            SELECT 
-                m.text, m.timestamp,
-                to_jsonb(u) as user,
-                COALESCE(
-                    (SELECT jsonb_agg(med.* ORDER BY med.id) FROM media med WHERE med.message_id = m.id), 
-                    '[]'::jsonb
-                ) as media
-            FROM 
-                messages m
-            LEFT JOIN 
-                users u ON m.user_id = u.id
-        """
-        where_clauses = []
-        params = []
-        
-        if telegram_user_id:
-            where_clauses.append("u.telegram_user_id = %s")
-            params.append(telegram_user_id)
-        if start_date:
-            where_clauses.append("m.timestamp >= %s")
-            params.append(start_date)
-        if end_date:
-            where_clauses.append("m.timestamp <= %s")
-            params.append(end_date)
-        
-        if where_clauses:
-            query += " WHERE " + " AND ".join(where_clauses)
+    # ---------------------------------------------------------
+    # ROUTE HANDLER METHODS
+    # ---------------------------------------------------------
+    
+    async def get_all_users(self):
+        return await self.db.db.users.find({}, {"_id": 0}).sort("first_name", 1).to_list(length=1000)
+
+    async def get_trips(self):
+        return await self.db.db.trips.find({}, {"_id": 0}).sort("start_date", -1).to_list(length=1000)
+
+    async def get_messages(
+        self,
+        telegram_user_id: Optional[int] = None,
+        start_date: Optional[datetime] = None,
+        end_date: Optional[datetime] = None,
+        page: int = Query(1, ge=1),
+        limit: int = Query(25, ge=1, le=100)
+    ):
+        query = {}
+        if telegram_user_id: query["telegram_user_id"] = telegram_user_id
             
-        query += " ORDER BY m.timestamp ASC;"
-        
-        cur.execute(query, tuple(params))
-        messages = cur.fetchall()
+        date_query = {}
+        if start_date: date_query["$gte"] = start_date
+        if end_date: date_query["$lte"] = end_date
+        if date_query: query["timestamp"] = date_query
 
-        # 3. --- UPDATED: Create a list of structured objects ---
-        export_data = []
+        total_count = await self.db.db.messages.count_documents(query)
+        total_pages = math.ceil(total_count / limit) if total_count > 0 else 0
+        skip = (page - 1) * limit
+
+        messages = await self.db.db.messages.find(query, {"_id": 0}).sort("timestamp", -1).skip(skip).limit(limit).to_list(length=limit)
+
         for msg in messages:
-            user_name = msg['user']['first_name'] if msg['user'] and msg['user']['first_name'] else 'Unknown'
-            timestamp_str = msg['timestamp'].isoformat()
-            
-            message_entry = {
-                "timestamp": timestamp_str,
-                "user": user_name,
-                "text": msg['text'] or None
-            }
-            
-            # Add media data if it exists
-            for media_item in msg['media']:
-                if media_item['media_type'] == 'photo' and media_item['description']:
-                    message_entry["image_description"] = media_item['description']
-                if media_item['media_type'] in ('audio', 'voice') and media_item['transcription']:
-                    message_entry["audio_transcription"] = media_item['transcription']
-                if media_item['media_type'] == 'location':
-                    message_entry["location"] = f"({media_item['latitude']}, {media_item['longitude']})"
-            
-            export_data.append(message_entry)
-
-        # 4. --- UPDATED: Save the data as a JSON file ---
-        export_filename = "_test_export.json"
-        try:
-            export_dir = os.path.join(os.path.dirname(__file__), "exports")
-            os.makedirs(export_dir, exist_ok=True)
-            export_path = os.path.join(export_dir, export_filename)
-
-            # Write the file as a JSON list
-            with open(export_path, "w", encoding="utf-8") as f:
-                json.dump(export_data, f, indent=2)
+            msg["id"] = msg.get("message_id") # React Key Polyfill
                 
-            print(f"Export saved to {export_path}")
+            if "media" not in msg: msg["media"] = []
+            if "user" not in msg:
+                user_doc = await self.db.db.users.find_one({"telegram_user_id": msg.get("telegram_user_id")}, {"_id": 0})
+                msg["user"] = user_doc if user_doc else {"first_name": "Unknown User"}
+                
+        return {"messages": messages, "total_count": total_count, "total_pages": total_pages, "current_page": page}
+
+    async def export_messages(self, telegram_user_id: Optional[int] = None):
+        query = {"telegram_user_id": telegram_user_id} if telegram_user_id else {}
+        messages = await self.db.db.messages.find(query, {"_id": 0}).sort("timestamp", 1).to_list(length=10000)
+        
+        for msg in messages:
+            msg["id"] = msg.get("message_id")
+            
+            if msg.get("timestamp"):
+                # FIX 1: Safely convert the native Datetime object into a millisecond timestamp
+                msg["timestamp"] = int(msg["timestamp"].timestamp() * 1000)
+                
+            if "user" not in msg:
+                user_doc = await self.db.db.users.find_one({"telegram_user_id": msg.get("telegram_user_id")}, {"_id": 0})
+                msg["user"] = user_doc if user_doc else {"first_name": "Unknown User"}
+                
+        return messages
+
+    async def get_media_url(self, key: str, request: Request):
+        env_base = os.environ.get("VITE_API_URL")
+        base_url = env_base.rstrip("/") if env_base else str(request.base_url).rstrip("/")
+        return {"url": f"{base_url}/static-media/{key}"}
+
+    async def update_media_field(self, media_id: str, field_name: str, payload: dict = Body(...)):
+        if field_name not in ["description", "transcription"]:
+            raise HTTPException(status_code=400, detail="Invalid field name")
+            
+        await self.db.update_media_field(media_id, field_name, payload.get(field_name, ""))
+        return await self.db.get_media_record(media_id)
+
+    async def generate_media_description(self, media_id: str):
+        media_item = await self.db.get_media_record(media_id)
+        if not media_item: raise HTTPException(status_code=404, detail="Media not found")
+            
+        absolute_path = os.path.join(self.local_media_path, media_item.get("file_path"))
+        
+        # FIX 2: Dynamically detect MIME type with a generic image fallback
+        mime_type, _ = mimetypes.guess_type(absolute_path)
+        mime_type = mime_type or "image/jpeg"
+        
+        try:
+            async with aiofiles.open(absolute_path, 'rb') as f:
+                file_bytes = await f.read()
+                
+            generated_text = await self.ai.generate_description(file_bytes, mime_type)
+            await self.db.update_media_field(media_id, "description", generated_text)
+            
+            media_item["description"] = generated_text
+            return media_item
         except Exception as e:
-            print(f"Warning: failed to save export locally: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
 
-        # 5. Return the structured list to the frontend
-        return export_data
-
-# --- NEW ENDPOINT FOR SUMMARIZATION (AI) ---
-@app.post("/summarize", response_model=dict)
-async def generate_summary(request: SummarizeRequest):
-    """
-    Takes a large block of text and generates a summary using Gemini.
-    """
-    if not GOOGLE_API_KEY:
-        raise HTTPException(status_code=501, detail="Gemini API key not configured")
-
-    try:
-        final_prompt = request.prompt or "Summarize the following field notes, messages, descriptions, and transcriptions into a concise report. Group observations by theme or location if possible:"
+    async def generate_media_transcription(self, media_id: str):
+        media_item = await self.db.get_media_record(media_id)
+        if not media_item: raise HTTPException(status_code=404, detail="Media not found")
+            
+        absolute_path = os.path.join(self.local_media_path, media_item.get("file_path"))
         
-        full_content = final_prompt + "\n\n--- DATA START ---\n" + request.full_text + "\n--- DATA END ---"
+        # FIX 2: Dynamically detect MIME type with a generic audio fallback
+        mime_type, _ = mimetypes.guess_type(absolute_path)
+        mime_type = mime_type or "audio/ogg"
         
-        # Send to Gemini
-        response = await vision_model.generate_content_async(full_content)
-        
-        return {"summary": response.text}
-        
-    except Exception as e:
-        print(f"Error generating summary: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        try:
+            async with aiofiles.open(absolute_path, 'rb') as f:
+                file_bytes = await f.read()
+                
+            generated_text = await self.ai.generate_transcription(file_bytes, mime_type)
+            await self.db.update_media_field(media_id, "transcription", generated_text)
+            
+            media_item["transcription"] = generated_text
+            return media_item
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
 
-# --- Run the App ---
-if __name__ == "__main__":
-    print("Starting FastAPI server on http://127.0.0.1:8000")
-    uvicorn.run("api:app", host="127.0.0.1", port=8000, reload=True)
-
-# --- DEPLOYMENT HANDLER FOR AWS LAMBDA ---
-from mangum import Mangum
-handler = Mangum(app)
+# --- APP EXPORT ---
+# Uvicorn looks for a global 'app' object in the file. 
+# We instantiate our class and expose the embedded FastAPI app instance.
+api_instance = FieldNotesAPI()
+app = api_instance.app

@@ -1,0 +1,8 @@
+# Database and Media local volumes
+mongo_data/
+media_data/
+
+# Other standard ignores (if you don't have them already)
+node_modules/
+__pycache__/
+.env
