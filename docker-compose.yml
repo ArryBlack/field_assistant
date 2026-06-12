@@ -12,7 +12,6 @@ services:
     build:
       context: .
       dockerfile: packages/backend/Dockerfile
-    user: root
     env_file: .env
     environment:
       - PYTHONUNBUFFERED=1
@@ -20,7 +19,6 @@ services:
       - "5002:8000"
     restart: unless-stopped
     volumes:
-      - ./packages/backend:/app/packages/backend
       - ./media_data:/app/media 
     depends_on:
       - mongodb
@@ -30,12 +28,10 @@ services:
     build:
       context: .
       dockerfile: packages/backend/Dockerfile
-    user: root
     env_file: .env
     command: ["/usr/local/bin/start.sh", "fetcher"]
     restart: unless-stopped
     volumes:
-      - ./packages/backend:/app/packages/backend
       - ./media_data:/app/media
     depends_on:
       - mongodb

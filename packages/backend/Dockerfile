@@ -29,8 +29,10 @@ COPY packages/backend/start.sh /usr/local/bin/start.sh
 RUN sed -i 's/\r$//' /usr/local/bin/start.sh \
     && chmod +x /usr/local/bin/start.sh
 
-# Create non-root user
-RUN useradd --create-home appuser || true
+# Create non-root user AND change ownership of the app directory
+RUN useradd --create-home appuser && \
+    chown -R appuser:appuser /app
+
 USER appuser
 
 EXPOSE 8000
