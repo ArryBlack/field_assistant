@@ -10,7 +10,7 @@ ENV PYTHONPATH=/app/packages/backend:/app
 
 # System deps for PostgreSQL client and build tools
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends gcc libpq-dev curl ca-certificates \
+    && apt-get install -y --no-install-recommends gcc libpq-dev curl ca-certificates gosu \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy only requirements first for better cache utilization
@@ -23,19 +23,20 @@ RUN pip install --no-cache-dir -r /app/requirements.txt \
 # Copy repository into image
 COPY . /app
 
-# Copy start script from package folder
+# Copy scripts from package folder
 COPY packages/backend/start.sh /usr/local/bin/start.sh
+COPY packages/backend/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+
 # Ensure LF line endings (avoid CRLF issues from Windows hosts)
-RUN sed -i 's/\r$//' /usr/local/bin/start.sh \
-    && chmod +x /usr/local/bin/start.sh
+RUN sed -i 's/\r$//' /usr/local/bin/start.sh /usr/local/bin/docker-entrypoint.sh \
+    && chmod +x /usr/local/bin/start.sh /usr/local/bin/docker-entrypoint.sh
 
 # Create non-root user AND change ownership of the app directory
-RUN useradd --create-home appuser && \
-    chown -R appuser:appuser /app
-
-USER appuser
+RUN useradd --create-home appuser 
 
 EXPOSE 8000
+
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 
 # Default: run API. Start script supports modes (api, fetcher, both)
 CMD ["/usr/local/bin/start.sh", "api"]

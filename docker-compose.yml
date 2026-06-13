@@ -1,51 +1,66 @@
 services:
   mongodb:
     image: mongo:7.0
+    container_name: field_assistant_mongodb
     restart: unless-stopped
     environment:
       MONGO_INITDB_ROOT_USERNAME: ${MONGO_USER}
       MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASS}
     volumes:
-      - ${SSD_DATA_PATH:-./mongo_data}:/data/db
+      - /var/lib/field_assistant_mongodb:/data/db
+    networks:
+      - field_assistant_network
 
   backend-api:
     build:
       context: .
       dockerfile: packages/backend/Dockerfile
-    env_file: .env
+    container_name: field_assistant_backend
+    env_file:
+      - .env
     environment:
-      - PYTHONUNBUFFERED=1
+      PYTHONUNBUFFERED: "1"
     ports:
       - "5002:8000"
     restart: unless-stopped
     volumes:
-      - ./media_data:/app/media 
+      - /data/field_assistant/media:/app/media
     depends_on:
       - mongodb
-
+    networks:
+      - field_assistant_network
 
   fetcher:
     build:
       context: .
       dockerfile: packages/backend/Dockerfile
-    env_file: .env
+    container_name: field_assistant_fetcher
+    env_file:
+      - .env
     command: ["/usr/local/bin/start.sh", "fetcher"]
     restart: unless-stopped
     volumes:
-      - ./media_data:/app/media
+      - /data/field_assistant/media:/app/media
     depends_on:
       - mongodb
+    networks:
+      - field_assistant_network
 
-  # --- VITE FRONTEND ---
   frontend:
     build:
       context: .
       dockerfile: packages/frontend/Dockerfile
       args:
-        VITE_API_URL: ${VITE_API_URL:-http://backend-api:5002}
+        VITE_API_URL: ${VITE_API_URL}
+    container_name: field_assistant_frontend
     ports:
       - "5003:80"
     restart: unless-stopped
-    
     depends_on:
       - backend-api
+    networks:
+      - field_assistant_network
+
+networks:
+  field_assistant_network:
+    driver: bridge
