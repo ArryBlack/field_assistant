@@ -56,3 +56,7 @@ htmlcov/
 # Local development settings
 *.local
 *.local.*
+
+/media_data
+
+/mongo_data

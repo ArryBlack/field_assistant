@@ -315,7 +315,8 @@ function App() {
         if (msg.id === updatedMedia.message_id) {
           return {
             ...msg,
-            media: msg.media.map(m => m.id === updatedMedia.id ? updatedMedia : m)
+            // Fallback to an empty array before mapping
+            media: (msg.media || []).map(m => m.id === updatedMedia.id ? updatedMedia : m)
           };
         }
         return msg;
@@ -391,14 +392,16 @@ function App() {
   };
   
   // --- Smart handlers for date inputs (Unchanged) ---
-  const handleStartDateChange = (e: ChangeEvent<HTMLInputElement>) => {
+const handleStartDateChange = (e: ChangeEvent<HTMLInputElement>) => {
     const newValue = e.target.value;
     if (!newValue) {
       setStartDate("");
       return;
     }
     const newDatePart = newValue.split('T')[0];
-    const oldDatePart = startDate.split('T')[0];
+    // Safely check if startDate exists before splitting
+    const oldDatePart = startDate ? startDate.split('T')[0] : "";
+    
     if (newDatePart !== oldDatePart) {
       setStartDate(newDatePart + "T00:00");
     } else {
@@ -406,14 +409,16 @@ function App() {
     }
   };
 
-  const handleEndDateChange = (e: ChangeEvent<HTMLInputElement>) => {
+const handleEndDateChange = (e: ChangeEvent<HTMLInputElement>) => {
     const newValue = e.target.value;
     if (!newValue) {
       setEndDate("");
       return;
     }
     const newDatePart = newValue.split('T')[0];
-    const oldDatePart = endDate.split('T')[0];
+    // Safely check if endDate exists before splitting
+    const oldDatePart = endDate ? endDate.split('T')[0] : "";
+    
     if (newDatePart !== oldDatePart) {
       setEndDate(newDatePart + "T23:59");
     } else {
@@ -559,18 +564,18 @@ function App() {
                   {msg.user?.first_name || 'Unknown User'}
                 </strong>
                 <span className="text-sm text-gray-500">
-                  {new Date(msg.timestamp).toLocaleString()}
+                  {new Date(msg.timestamp.endsWith('Z') ? msg.timestamp : msg.timestamp + 'Z').toLocaleString()}
                 </span>
               </div>
-              {msg.survey_question && (
+              {msg.question && (
                 <div className="bg-blue-50 border-l-4 border-blue-400 p-2 mb-2 rounded-r-md text-sm text-blue-800 italic">
-                  <strong>Q: </strong> {msg.survey_question}
+                  <strong>Q: </strong> {msg.question}
                 </div>
               )}
               {msg.text && (
                 <p className="text-base text-gray-800 my-2 whitespace-pre-wrap">{msg.text}</p>
               )}
-              {msg.media.length > 0 && (
+              {(msg.media || []).length > 0 && (
                 <div className="mt-3 pt-3 border-t border-gray-200 border-dashed flex flex-col gap-4">
                   {msg.media.map((item) => (
                     <LazyMediaItem key={item.id} media={item} onUpdate={handleMediaUpdated} />

@@ -24,7 +24,7 @@ export interface Message {
   id: number;
   telegram_message_id: number;
   text: string | null;
-  survey_question: string | null;
+  question: string | null;
   timestamp: string;
   user: User | null;
   media: Media[];
