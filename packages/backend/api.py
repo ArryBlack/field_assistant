@@ -119,8 +119,22 @@ class FieldNotesAPI:
                 
         return {"messages": messages, "total_count": total_count, "total_pages": total_pages, "current_page": page}
 
-    async def export_messages(self, telegram_user_id: Optional[int] = None):
-        query = {"telegram_user_id": telegram_user_id} if telegram_user_id else {}
+    async def export_messages(
+        self, 
+        telegram_user_id: Optional[int] = None,
+        start_date: Optional[datetime] = None,
+        end_date: Optional[datetime] = None
+    ):
+        query = {}
+        if telegram_user_id: 
+            query["telegram_user_id"] = telegram_user_id
+            
+        # Add date filtering logic
+        date_query = {}
+        if start_date: date_query["$gte"] = start_date
+        if end_date: date_query["$lte"] = end_date
+        if date_query: query["timestamp"] = date_query
+
         messages = await self.db.db.messages.find(query, {"_id": 0}).sort("timestamp", 1).to_list(length=10000)
         
         for msg in messages:
