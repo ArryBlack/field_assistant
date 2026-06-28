@@ -97,7 +97,7 @@ class FieldNotesFetcher:
             if queue:
                 await self.db.set_user_state(user_id, "CONVERSE_Q", {"queue": queue, "index": 0})
                 first_item = queue[0]
-                prefix = "🎥 SUGGESTION:" if first_item.get("message_type") == "suggestion" else f"❓ QUESTION (Priority {first_item.get('importance', 0)}):"
+                prefix = "🎥 SUGGESTION:" if first_item.get("message_type") == "suggestion" else f"❓ QUESTION:"
                 
                 await self.bot.send_message(chat_id, f"{prefix}\n{first_item.get('text', '')}")
             else:
@@ -225,9 +225,7 @@ class FieldNotesFetcher:
                         else:
                             answered_question = await self._handle_fsm_state(user_id, chat_id, text, msg, state, state_data)
 
-                        # Skip logging the initial setup questions into the timeline notes
-                        if not is_command and state not in ["TRIP_Q1", "TRIP_Q2", "TRIP_Q3"]:
-                            await self._process_passive_media(user_id, msg_id, text, msg, answered_question)
+                        await self._process_passive_media(user_id, msg_id, text, msg, answered_question)
 
                     offset = update_id + 1
                     await self.db.update_offset(update_id)
