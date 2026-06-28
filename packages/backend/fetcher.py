@@ -97,7 +97,7 @@ class FieldNotesFetcher:
             if queue:
                 await self.db.set_user_state(user_id, "CONVERSE_Q", {"queue": queue, "index": 0})
                 first_item = queue[0]
-                prefix = "🎥 SUGGESTION:" if first_item.get("message_type") == "suggestion" else f"❓ QUESTION (Priority {first_item.get('importance', 0)}):"
+                prefix = "🎥 SUGGESTION:" if first_item.get("message_type") == "suggestion" else f"❓ QUESTION:"
                 
                 await self.bot.send_message(chat_id, f"{prefix}\n{first_item.get('text', '')}")
             else:
