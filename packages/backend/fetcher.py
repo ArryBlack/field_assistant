@@ -225,9 +225,7 @@ class FieldNotesFetcher:
                         else:
                             answered_question = await self._handle_fsm_state(user_id, chat_id, text, msg, state, state_data)
 
-                        # Skip logging the initial setup questions into the timeline notes
-                        if not is_command and state not in ["TRIP_Q1", "TRIP_Q2", "TRIP_Q3"]:
-                            await self._process_passive_media(user_id, msg_id, text, msg, answered_question)
+                        await self._process_passive_media(user_id, msg_id, text, msg, answered_question)
 
                     offset = update_id + 1
                     await self.db.update_offset(update_id)
